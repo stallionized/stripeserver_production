@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: linkby6-stripe-server
+    env: node
+    plan: starter
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3000
+      - key: LOG_LEVEL
+        value: info
+      # Add your actual environment variables in Render dashboard:
+      # STRIPE_SECRET_KEY (from your Stripe dashboard)
+      # STRIPE_WEBHOOK_SECRET (from your Stripe webhook configuration)
+      # STRIPE_PRICE_ESSENTIAL_MONTHLY (your actual price ID)
+      # STRIPE_PRICE_ESSENTIAL_YEARLY (your actual price ID)
+      # STRIPE_PRICE_GROWTH_MONTHLY (your actual price ID)
+      # STRIPE_PRICE_GROWTH_YEARLY (your actual price ID)
+      # STRIPE_PRICE_PRO_MONTHLY (your actual price ID)
+      # STRIPE_PRICE_PRO_YEARLY (your actual price ID)
+      # SUPABASE_URL (optional)
+      # SUPABASE_SERVICE_KEY (optional)
+      # ALLOWED_ORIGINS (optional)
