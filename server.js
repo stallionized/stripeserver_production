@@ -39,28 +39,166 @@ const logger = winston.createLogger({
   ]
 });
 
-// Stripe Price IDs Configuration
-const STRIPE_PRICE_IDS = {
-  essential: {
-    monthly: process.env.STRIPE_PRICE_ESSENTIAL_MONTHLY || 'price_essential_monthly',
-    yearly: process.env.STRIPE_PRICE_ESSENTIAL_YEARLY || 'price_essential_yearly',
-  },
-  growth: {
-    monthly: process.env.STRIPE_PRICE_GROWTH_MONTHLY || 'price_growth_monthly',
-    yearly: process.env.STRIPE_PRICE_GROWTH_YEARLY || 'price_growth_yearly',
-  },
-  'pro-enterprise': {
-    monthly: process.env.STRIPE_PRICE_PRO_MONTHLY || 'price_pro_monthly',
-    yearly: process.env.STRIPE_PRICE_PRO_YEARLY || 'price_pro_yearly',
-  },
+// Dynamic Product Catalog Cache
+let productCatalogCache = {
+  products: [],
+  prices: {},
+  lastUpdated: null,
+  cacheExpiry: 5 * 60 * 1000 // 5 minutes
 };
+
+// Dynamic Product Catalog Service
+class ProductCatalogService {
+  static async fetchProducts() {
+    try {
+      logger.info('Fetching products from Stripe...');
+      
+      // Fetch all active products
+      const products = await stripe.products.list({
+        active: true,
+        expand: ['data.default_price']
+      });
+
+      // Fetch all active prices
+      const prices = await stripe.prices.list({
+        active: true,
+        expand: ['data.product']
+      });
+
+      // Organize products and prices
+      const organizedCatalog = this.organizeProductCatalog(products.data, prices.data);
+      
+      // Update cache
+      productCatalogCache = {
+        products: organizedCatalog.products,
+        prices: organizedCatalog.prices,
+        lastUpdated: Date.now(),
+        cacheExpiry: 5 * 60 * 1000
+      };
+
+      logger.info(`Successfully cached ${organizedCatalog.products.length} products with ${Object.keys(organizedCatalog.prices).length} price variations`);
+      
+      return productCatalogCache;
+    } catch (error) {
+      logger.error('Error fetching products from Stripe:', error);
+      throw error;
+    }
+  }
+
+  static organizeProductCatalog(products, prices) {
+    const organizedProducts = [];
+    const organizedPrices = {};
+
+    // Process each product
+    products.forEach(product => {
+      // Get product metadata for organization
+      const planId = product.metadata.plan_id || product.name.toLowerCase().replace(/\s+/g, '-');
+      const planType = product.metadata.plan_type || 'subscription';
+      const displayOrder = parseInt(product.metadata.display_order) || 999;
+
+      // Find all prices for this product
+      const productPrices = prices.filter(price => price.product === product.id);
+      
+      const priceVariations = {};
+      productPrices.forEach(price => {
+        if (price.recurring) {
+          const interval = price.recurring.interval; // 'month' or 'year'
+          const intervalKey = interval === 'month' ? 'monthly' : 'yearly';
+          
+          priceVariations[intervalKey] = {
+            priceId: price.id,
+            unitAmount: price.unit_amount,
+            currency: price.currency,
+            interval: price.recurring.interval,
+            intervalCount: price.recurring.interval_count
+          };
+        } else {
+          // One-time payment
+          priceVariations['one_time'] = {
+            priceId: price.id,
+            unitAmount: price.unit_amount,
+            currency: price.currency
+          };
+        }
+      });
+
+      // Add to organized structure
+      const organizedProduct = {
+        id: product.id,
+        name: product.name,
+        description: product.description,
+        planId: planId,
+        planType: planType,
+        displayOrder: displayOrder,
+        features: product.metadata.features ? JSON.parse(product.metadata.features) : [],
+        metadata: product.metadata,
+        prices: priceVariations,
+        active: product.active
+      };
+
+      organizedProducts.push(organizedProduct);
+      
+      // Also store in prices lookup for quick access
+      organizedPrices[planId] = priceVariations;
+    });
+
+    // Sort products by display order
+    organizedProducts.sort((a, b) => a.displayOrder - b.displayOrder);
+
+    return {
+      products: organizedProducts,
+      prices: organizedPrices
+    };
+  }
+
+  static async getProductCatalog(forceRefresh = false) {
+    const now = Date.now();
+    const cacheExpired = !productCatalogCache.lastUpdated || 
+                        (now - productCatalogCache.lastUpdated) > productCatalogCache.cacheExpiry;
+
+    if (forceRefresh || cacheExpired || productCatalogCache.products.length === 0) {
+      return await this.fetchProducts();
+    }
+
+    return productCatalogCache;
+  }
+
+  static async validatePriceId(planId, billingCycle) {
+    const catalog = await this.getProductCatalog();
+    const planPrices = catalog.prices[planId];
+    
+    if (!planPrices || !planPrices[billingCycle]) {
+      return null;
+    }
+
+    return planPrices[billingCycle].priceId;
+  }
+
+  static async getProductByPlanId(planId) {
+    const catalog = await this.getProductCatalog();
+    return catalog.products.find(product => product.planId === planId);
+  }
+}
 
 // Middleware
 app.use(helmet());
+
+// CORS Configuration - defaults to allow all origins for flexibility
+const corsOrigins = process.env.ALLOWED_ORIGINS 
+  ? process.env.ALLOWED_ORIGINS.split(',')
+  : '*'; // Allow all origins by default
+
 app.use(cors({
-  origin: process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : '*',
+  origin: corsOrigins,
   credentials: true
 }));
+
+// Log CORS configuration on startup
+if (corsOrigins === '*') {
+  logger.info('CORS: Allowing all origins (ALLOWED_ORIGINS not set)');
+} else {
+  logger.info(`CORS: Allowing specific origins: ${corsOrigins.join(', ')}`);
+}
 
 // Rate limiting
 const limiter = rateLimit({
@@ -120,16 +258,95 @@ app.get('/health', (req, res) => {
     status: 'healthy',
     timestamp: new Date().toISOString(),
     version: '1.0.0',
-    environment: process.env.NODE_ENV || 'development'
+    environment: process.env.NODE_ENV || 'development',
+    productCacheStatus: {
+      lastUpdated: productCatalogCache.lastUpdated,
+      productsCount: productCatalogCache.products.length,
+      pricesCount: Object.keys(productCatalogCache.prices).length
+    }
   });
 });
 
-// Get available price IDs (for debugging)
-app.get('/price-ids', (req, res) => {
-  res.json({
-    priceIds: STRIPE_PRICE_IDS,
-    environment: process.env.NODE_ENV || 'development'
-  });
+// Get product catalog endpoint
+app.get('/products', async (req, res) => {
+  try {
+    const forceRefresh = req.query.refresh === 'true';
+    const catalog = await ProductCatalogService.getProductCatalog(forceRefresh);
+    
+    res.json({
+      products: catalog.products,
+      lastUpdated: catalog.lastUpdated,
+      cacheExpiry: catalog.cacheExpiry
+    });
+  } catch (error) {
+    logger.error('Error fetching product catalog:', error);
+    res.status(500).json({
+      error: 'Failed to fetch product catalog',
+      message: error.message
+    });
+  }
+});
+
+// Get specific product details
+app.get('/products/:planId', async (req, res) => {
+  try {
+    const { planId } = req.params;
+    const product = await ProductCatalogService.getProductByPlanId(planId);
+    
+    if (!product) {
+      return res.status(404).json({
+        error: 'Product not found',
+        planId: planId
+      });
+    }
+
+    res.json(product);
+  } catch (error) {
+    logger.error('Error fetching product details:', error);
+    res.status(500).json({
+      error: 'Failed to fetch product details',
+      message: error.message
+    });
+  }
+});
+
+// Get available price IDs (for debugging - now dynamic)
+app.get('/price-ids', async (req, res) => {
+  try {
+    const catalog = await ProductCatalogService.getProductCatalog();
+    res.json({
+      priceIds: catalog.prices,
+      environment: process.env.NODE_ENV || 'development',
+      lastUpdated: catalog.lastUpdated
+    });
+  } catch (error) {
+    logger.error('Error fetching price IDs:', error);
+    res.status(500).json({
+      error: 'Failed to fetch price IDs',
+      message: error.message
+    });
+  }
+});
+
+// Refresh product catalog endpoint
+app.post('/refresh-catalog', async (req, res) => {
+  try {
+    logger.info('Manual catalog refresh requested');
+    const catalog = await ProductCatalogService.getProductCatalog(true);
+    
+    res.json({
+      message: 'Product catalog refreshed successfully',
+      productsCount: catalog.products.length,
+      pricesCount: Object.keys(catalog.prices).length,
+      lastUpdated: catalog.lastUpdated
+    });
+  } catch (error) {
+    logger.error('Error refreshing product catalog:', error);
+    res.status(500).json({
+      error: 'Failed to refresh product catalog',
+      message: error.message
+    });
+  }
 });
 
 // Create or retrieve customer
@@ -201,12 +418,13 @@ app.post('/create-subscription', [
 
     logger.info(`Creating subscription for ${email} with plan ${planId} (${billingCycle})`);
 
-    // Validate price ID exists in our configuration
-    const validPriceId = STRIPE_PRICE_IDS[planId]?.[billingCycle];
+    // Validate price ID exists in our dynamic catalog
+    const validPriceId = await ProductCatalogService.validatePriceId(planId, billingCycle);
     if (!validPriceId || validPriceId !== priceId) {
       logger.warn(`Invalid price ID: ${priceId} for plan ${planId} (${billingCycle})`);
       return res.status(400).json({
-        error: 'Invalid price ID for the selected plan'
+        error: 'Invalid price ID for the selected plan',
+        availablePlans: Object.keys((await ProductCatalogService.getProductCatalog()).prices)
       });
     }
 
@@ -452,6 +670,203 @@ app.get('/subscription/:subscriptionId', async (req, res) => {
   }
 });
 
+// Get payment status for testing purposes
+app.get('/payment-status/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    if (!supabase) {
+      return res.status(500).json({
+        error: 'Database not configured',
+        message: 'Supabase integration is not available'
+      });
+    }
+
+    // Get business profile status
+    const { data: businessProfile, error: profileError } = await supabase
+      .from('business_profiles')
+      .select('business_status, is_active, stripe_customer_id')
+      .eq('user_id', userId)
+      .single();
+
+    if (profileError && profileError.code !== 'PGRST116') {
+      return res.status(500).json({
+        error: 'Failed to get business profile',
+        message: profileError.message
+      });
+    }
+
+    // Get subscription status
+    const { data: subscription, error: subscriptionError } = await supabase
+      .from('business_subscriptions')
+      .select('status, stripe_subscription_id, plan_id, billing_cycle, start_date')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .single();
+
+    if (subscriptionError && subscriptionError.code !== 'PGRST116') {
+      return res.status(500).json({
+        error: 'Failed to get subscription',
+        message: subscriptionError.message
+      });
+    }
+
+    // Determine overall status
+    let status = 'no_subscription';
+    let message = 'No subscription found';
+    let isActive = false;
+
+    if (subscription && businessProfile) {
+      isActive = businessProfile.is_active && businessProfile.business_status === 'Active';
+      
+      if (subscription.status === 'active' && isActive) {
+        status = 'success';
+        message = '🎉 Payment successful! Your business profile has been activated and is ready to use.';
+      } else if (subscription.status === 'incomplete') {
+        status = 'pending';
+        message = '⏳ Payment is being processed. Please wait for confirmation.';
+      } else if (subscription.status === 'past_due') {
+        status = 'error';
+        message = '❌ Payment failed. Your business profile has been deactivated. Please update your payment method.';
+      } else if (subscription.status === 'canceled') {
+        status = 'canceled';
+        message = '⚠️ Subscription has been canceled. Your business profile is inactive.';
+      } else {
+        status = 'error';
+        message = `❌ Subscription status: ${subscription.status}. Business profile status: ${businessProfile.business_status}`;
+      }
+    } else if (!businessProfile) {
+      status = 'no_profile';
+      message = '⚠️ No business profile found. Please create a business profile first.';
+    }
+
+    res.json({
+      status,
+      message,
+      isActive,
+      businessProfile: businessProfile ? {
+        businessStatus: businessProfile.business_status,
+        isActive: businessProfile.is_active,
+        hasStripeCustomer: !!businessProfile.stripe_customer_id
+      } : null,
+      subscription: subscription ? {
+        status: subscription.status,
+        stripeSubscriptionId: subscription.stripe_subscription_id,
+        planId: subscription.plan_id,
+        billingCycle: subscription.billing_cycle,
+        startDate: subscription.start_date
+      } : null
+    });
+
+  } catch (error) {
+    logger.error('Error getting payment status:', error);
+    res.status(500).json({
+      status: 'error',
+      message: '❌ Failed to check payment status. Please try again.',
+      error: error.message
+    });
+  }
+});
+
+// Test payment completion endpoint (for testing purposes)
+app.post('/test-payment-complete', [
+  body('userId').isString().notEmpty(),
+  body('subscriptionId').isString().notEmpty(),
+  body('success').isBoolean()
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        status: 'error',
+        message: '❌ Invalid request data',
+        details: errors.array()
+      });
+    }
+
+    const { userId, subscriptionId, success } = req.body;
+
+    if (!supabase) {
+      return res.status(500).json({
+        status: 'error',
+        message: '❌ Database not configured'
+      });
+    }
+
+    if (success) {
+      // Simulate successful payment
+      try {
+        // Get subscription from Stripe
+        const subscription = await stripe.subscriptions.retrieve(subscriptionId);
+        
+        // Update business subscription
+        const subscriptionData = {
+          subscriptionId: subscription.id,
+          customerId: subscription.customer,
+          status: 'active',
+          planName: subscription.metadata.planName || 'Test Plan',
+          billingCycle: subscription.metadata.billingCycle || 'monthly',
+          currentPeriodStart: new Date(subscription.current_period_start * 1000).toISOString(),
+          currentPeriodEnd: new Date(subscription.current_period_end * 1000).toISOString(),
+          nextBillingDate: new Date(subscription.current_period_end * 1000).toISOString()
+        };
+
+        await createOrUpdateBusinessSubscription(userId, subscriptionData);
+
+        // Activate business profile
+        await activateBusinessProfile(userId, {
+          customerId: subscription.customer,
+          subscriptionId: subscription.id
+        });
+
+        res.json({
+          status: 'success',
+          message: '🎉 Test payment completed successfully! Your business profile has been activated.',
+          businessActivated: true
+        });
+
+      } catch (error) {
+        logger.error('Error processing test payment success:', error);
+        res.status(500).json({
+          status: 'error',
+          message: '❌ Failed to process test payment success: ' + error.message
+        });
+      }
+    } else {
+      // Simulate failed payment
+      try {
+        // Update business profile to inactive
+        await updateSupabaseProfile(userId, {
+          subscription_status: 'past_due',
+          business_status: 'Not Active',
+          is_active: false
+        });
+
+        res.json({
+          status: 'error',
+          message: '❌ Test payment failed. Business profile has been deactivated.',
+          businessActivated: false
+        });
+
+      } catch (error) {
+        logger.error('Error processing test payment failure:', error);
+        res.status(500).json({
+          status: 'error',
+          message: '❌ Failed to process test payment failure: ' + error.message
+        });
+      }
+    }
+
+  } catch (error) {
+    logger.error('Error in test payment completion:', error);
+    res.status(500).json({
+      status: 'error',
+      message: '❌ Test payment processing failed: ' + error.message
+    });
+  }
+});
+
 // Webhook event handler
 async function handleWebhookEvent(event) {
   switch (event.type) {
@@ -480,6 +895,22 @@ async function handleWebhookEvent(event) {
       await handlePaymentFailed(event.data.object);
       break;
 
+    case 'product.created':
+    case 'product.updated':
+    case 'product.deleted':
+    case 'price.created':
+    case 'price.updated':
+    case 'price.deleted':
+      logger.info(`Product/Price catalog changed: ${event.type}`);
+      // Refresh product catalog when products or prices change
+      try {
+        await ProductCatalogService.getProductCatalog(true);
+        logger.info('Product catalog refreshed due to webhook event');
+      } catch (error) {
+        logger.error('Failed to refresh product catalog:', error);
+      }
+      break;
+
     default:
       logger.info(`Unhandled event type: ${event.type}`);
   }
@@ -489,10 +920,28 @@ async function handleWebhookEvent(event) {
 async function handleSubscriptionCreated(subscription) {
   if (supabase && subscription.metadata.userId) {
     try {
+      // Create business subscription record
+      const subscriptionData = {
+        subscriptionId: subscription.id,
+        customerId: subscription.customer,
+        status: subscription.status,
+        planName: subscription.metadata.planName || 'Unknown Plan',
+        billingCycle: subscription.metadata.billingCycle || 'monthly',
+        currentPeriodStart: new Date(subscription.current_period_start * 1000).toISOString(),
+        currentPeriodEnd: new Date(subscription.current_period_end * 1000).toISOString(),
+        nextBillingDate: new Date(subscription.current_period_end * 1000).toISOString()
+      };
+
+      await createOrUpdateBusinessSubscription(subscription.metadata.userId, subscriptionData);
+
+      // Also update the business profile
       await updateSupabaseProfile(subscription.metadata.userId, {
         subscription_status: subscription.status,
-        subscription_id: subscription.id
+        subscription_id: subscription.id,
+        stripe_customer_id: subscription.customer
       });
+
+      logger.info(`Successfully processed subscription creation for user: ${subscription.metadata.userId}`);
     } catch (error) {
       logger.error('Error updating profile on subscription created:', error);
     }
@@ -502,9 +951,26 @@ async function handleSubscriptionCreated(subscription) {
 async function handleSubscriptionUpdated(subscription) {
   if (supabase && subscription.metadata.userId) {
     try {
+      // Update business subscription record
+      const subscriptionData = {
+        subscriptionId: subscription.id,
+        customerId: subscription.customer,
+        status: subscription.status,
+        planName: subscription.metadata.planName || 'Unknown Plan',
+        billingCycle: subscription.metadata.billingCycle || 'monthly',
+        currentPeriodStart: new Date(subscription.current_period_start * 1000).toISOString(),
+        currentPeriodEnd: new Date(subscription.current_period_end * 1000).toISOString(),
+        nextBillingDate: new Date(subscription.current_period_end * 1000).toISOString()
+      };
+
+      await createOrUpdateBusinessSubscription(subscription.metadata.userId, subscriptionData);
+
+      // Also update the business profile
       await updateSupabaseProfile(subscription.metadata.userId, {
         subscription_status: subscription.status
       });
+
+      logger.info(`Successfully processed subscription update for user: ${subscription.metadata.userId}`);
     } catch (error) {
       logger.error('Error updating profile on subscription updated:', error);
     }
@@ -514,10 +980,26 @@ async function handleSubscriptionUpdated(subscription) {
 async function handleSubscriptionDeleted(subscription) {
   if (supabase && subscription.metadata.userId) {
     try {
+      // Update business subscription status to canceled
+      const subscriptionData = {
+        subscriptionId: subscription.id,
+        customerId: subscription.customer,
+        status: 'canceled',
+        planName: subscription.metadata.planName || 'Unknown Plan',
+        billingCycle: subscription.metadata.billingCycle || 'monthly'
+      };
+
+      await createOrUpdateBusinessSubscription(subscription.metadata.userId, subscriptionData);
+
+      // Update business profile to inactive
       await updateSupabaseProfile(subscription.metadata.userId, {
         subscription_status: 'canceled',
-        subscription_id: null
+        subscription_id: null,
+        business_status: 'Not Active',
+        is_active: false
       });
+
+      logger.info(`Successfully processed subscription deletion for user: ${subscription.metadata.userId}`);
     } catch (error) {
       logger.error('Error updating profile on subscription deleted:', error);
     }
@@ -529,9 +1011,27 @@ async function handlePaymentSucceeded(invoice) {
     try {
       const subscription = await stripe.subscriptions.retrieve(invoice.subscription);
       if (subscription.metadata.userId) {
-        await updateSupabaseProfile(subscription.metadata.userId, {
-          subscription_status: 'active'
+        // Update business subscription to active
+        const subscriptionData = {
+          subscriptionId: subscription.id,
+          customerId: subscription.customer,
+          status: 'active',
+          planName: subscription.metadata.planName || 'Unknown Plan',
+          billingCycle: subscription.metadata.billingCycle || 'monthly',
+          currentPeriodStart: new Date(subscription.current_period_start * 1000).toISOString(),
+          currentPeriodEnd: new Date(subscription.current_period_end * 1000).toISOString(),
+          nextBillingDate: new Date(subscription.current_period_end * 1000).toISOString()
+        };
+
+        await createOrUpdateBusinessSubscription(subscription.metadata.userId, subscriptionData);
+
+        // Activate business profile
+        await activateBusinessProfile(subscription.metadata.userId, {
+          customerId: subscription.customer,
+          subscriptionId: subscription.id
         });
+
+        logger.info(`Successfully activated business profile and subscription for user: ${subscription.metadata.userId}`);
       }
     } catch (error) {
       logger.error('Error updating profile on payment succeeded:', error);
@@ -544,9 +1044,25 @@ async function handlePaymentFailed(invoice) {
     try {
       const subscription = await stripe.subscriptions.retrieve(invoice.subscription);
       if (subscription.metadata.userId) {
+        // Update business subscription to past_due
+        const subscriptionData = {
+          subscriptionId: subscription.id,
+          customerId: subscription.customer,
+          status: 'past_due',
+          planName: subscription.metadata.planName || 'Unknown Plan',
+          billingCycle: subscription.metadata.billingCycle || 'monthly'
+        };
+
+        await createOrUpdateBusinessSubscription(subscription.metadata.userId, subscriptionData);
+
+        // Update business profile status
         await updateSupabaseProfile(subscription.metadata.userId, {
-          subscription_status: 'past_due'
+          subscription_status: 'past_due',
+          business_status: 'Not Active',
+          is_active: false
         });
+
+        logger.info(`Successfully processed payment failure for user: ${subscription.metadata.userId}`);
       }
     } catch (error) {
       logger.error('Error updating profile on payment failed:', error);
@@ -574,6 +1090,134 @@ async function updateSupabaseProfile(userId, updates) {
   }
 }
 
+// Create or update business subscription
+async function createOrUpdateBusinessSubscription(userId, subscriptionData) {
+  if (!supabase) {
+    logger.warn('Supabase not configured, skipping subscription update');
+    return;
+  }
+
+  try {
+    // First, get the business profile for this user
+    const { data: businessProfile, error: profileError } = await supabase
+      .from('business_profiles')
+      .select('business_id')
+      .eq('user_id', userId)
+      .single();
+
+    if (profileError && profileError.code !== 'PGRST116') { // PGRST116 = no rows returned
+      throw new Error(`Failed to get business profile: ${profileError.message}`);
+    }
+
+    // Get the plan_id from the plans table based on the product metadata
+    const { data: plan, error: planError } = await supabase
+      .from('plans')
+      .select('plan_id')
+      .eq('name', subscriptionData.planName)
+      .single();
+
+    if (planError) {
+      logger.warn(`Plan not found in database: ${subscriptionData.planName}. Creating subscription without plan reference.`);
+    }
+
+    // Create or update the business subscription
+    const subscriptionRecord = {
+      business_id: businessProfile?.business_id || null,
+      plan_id: plan?.plan_id || null,
+      user_id: userId,
+      status: subscriptionData.status,
+      billing_cycle: subscriptionData.billingCycle,
+      stripe_subscription_id: subscriptionData.subscriptionId,
+      stripe_customer_id: subscriptionData.customerId,
+      start_date: new Date().toISOString(),
+      next_billing_date: subscriptionData.nextBillingDate || null,
+      current_period_start: subscriptionData.currentPeriodStart || new Date().toISOString(),
+      current_period_end: subscriptionData.currentPeriodEnd || null,
+      updated_at: new Date().toISOString()
+    };
+
+    // Check if subscription already exists
+    const { data: existingSubscription, error: existingError } = await supabase
+      .from('business_subscriptions')
+      .select('subscription_id')
+      .eq('stripe_subscription_id', subscriptionData.subscriptionId)
+      .single();
+
+    if (existingError && existingError.code !== 'PGRST116') {
+      throw new Error(`Failed to check existing subscription: ${existingError.message}`);
+    }
+
+    let result;
+    if (existingSubscription) {
+      // Update existing subscription
+      const { data, error } = await supabase
+        .from('business_subscriptions')
+        .update(subscriptionRecord)
+        .eq('stripe_subscription_id', subscriptionData.subscriptionId)
+        .select();
+      
+      result = { data, error };
+    } else {
+      // Create new subscription
+      const { data, error } = await supabase
+        .from('business_subscriptions')
+        .insert([subscriptionRecord])
+        .select();
+      
+      result = { data, error };
+    }
+
+    if (result.error) {
+      throw new Error(`Failed to create/update subscription: ${result.error.message}`);
+    }
+
+    logger.info(`Successfully created/updated business subscription for user: ${userId}`);
+    return result.data[0];
+
+  } catch (error) {
+    logger.error('Error creating/updating business subscription:', error);
+    throw error;
+  }
+}
+
+// Activate business profile when payment succeeds
+async function activateBusinessProfile(userId, subscriptionData) {
+  if (!supabase) {
+    logger.warn('Supabase not configured, skipping profile activation');
+    return;
+  }
+
+  try {
+    // Update business profile to active status
+    const { data, error } = await supabase
+      .from('business_profiles')
+      .update({
+        business_status: 'Active',
+        is_active: true,
+        stripe_customer_id: subscriptionData.customerId,
+        updated_at: new Date().toISOString()
+      })
+      .eq('user_id', userId)
+      .select();
+
+    if (error) {
+      throw new Error(`Failed to activate business profile: ${error.message}`);
+    }
+
+    if (data && data.length > 0) {
+      logger.info(`Successfully activated business profile for user: ${userId}`);
+      return data[0];
+    } else {
+      logger.warn(`No business profile found to activate for user: ${userId}`);
+      return null;
+    }
+
+  } catch (error) {
+    logger.error('Error activating business profile:', error);
+    throw error;
+  }
+}
+
 // Error handling middleware
 app.use((error, req, res, next) => {
   logger.error('Unhandled error:', error);
@@ -592,11 +1236,26 @@ app.use((req, res) => {
   });
 });
 
+// Initialize product catalog on startup
+async function initializeProductCatalog() {
+  try {
+    logger.info('Initializing product catalog on startup...');
+    await ProductCatalogService.getProductCatalog(true);
+    logger.info('Product catalog initialized successfully');
+  } catch (error) {
+    logger.error('Failed to initialize product catalog:', error);
+    // Don't fail startup if catalog initialization fails
+  }
+}
+
 // Start server
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   logger.info(`LinkBy6 Stripe Server running on port ${PORT}`);
   logger.info(`Environment: ${process.env.NODE_ENV || 'development'}`);
   logger.info(`Supabase integration: ${supabase ? 'enabled' : 'disabled'}`);
+  
+  // Initialize product catalog
+  await initializeProductCatalog();
 });
 
 // Graceful shutdown
